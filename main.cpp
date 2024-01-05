@@ -10,12 +10,26 @@
 
 KSEQ_INIT(int, read)
 
+char dna_symbols[8] = {'a', 'c', 'g', 't', 'A', 'C', 'T', 'G'};
+
 struct arguments{
     std::string input_file;
     std::string output_file;
-    size_t n_genomes;
+    size_t n_genomes=0;
     float var_frac=0.01;
     size_t max_edit_len=10;
+};
+
+struct variant{
+    int type;
+    long pos_1{};
+    long pos_2{};
+    size_t chrom_1{};
+    size_t chrom_2{};
+    long len{};
+    char alt_allele{};
+    std::string alt_pat;
+    std::vector<bool> occ;
 };
 
 class MyFormatter : public CLI::Formatter {
@@ -56,11 +70,171 @@ int parse_app(CLI::App& app, struct arguments& args) {
     return 0;
 }
 
-void create_variants(std::vector<std::string>& genome, size_t g_len, float var_frac,
+void apply_variants(std::vector<std::string>& genome, size_t n_genomes, std::string& output_file,
+                    size_t max_edit_len, std::vector<variant>& variants){
+    std::string buffer;
+    buffer.resize(max_edit_len);
+    std::ofstream ofs(output_file, std::ios::binary | std::ios::out);
+    char *ptr1, *ptr2;
+    std::vector<long> chrom_offset(genome.size(), 0);
+
+    for(size_t i=0;i<n_genomes;i++) {
+        std::vector<std::string> new_genome = genome;
+
+        for(auto & variant : variants){
+            if(variant.occ[i]){
+                switch (variant.type) {
+                    case 0://SNP
+                        new_genome[variant.chrom_1][variant.pos_1] = variant.alt_allele;
+                        break;
+                    case 1://translocation
+                        ptr1 = new_genome[variant.chrom_1].data() + variant.pos_1;
+                        ptr2 = new_genome[variant.chrom_2].data() + variant.pos_2;
+                        memcpy(buffer.data(), ptr1, variant.len);
+                        memcpy(ptr1, ptr2, variant.len);
+                        memcpy(ptr2, buffer.data(), variant.len);
+                        break;
+                    case 2://inversion
+                        std::reverse(new_genome[variant.chrom_1].begin() + variant.pos_1,
+                                     new_genome[variant.chrom_1].begin() + variant.pos_1 + variant.len);
+                        break;
+                    case 3://deletion
+                        //TODO I have to fix this because it is not working
+                        new_genome[variant.chrom_1].erase(variant.pos_1, variant.len);
+                        break;
+                    case 4://insertion
+                        //TODO I have to fix this because it is not working
+                        new_genome[variant.chrom_1].insert(variant.pos_1, variant.alt_pat, 0, variant.len);
+                        break;
+                    default:
+                        std::cout<<"Error"<<std::endl;
+                        break;
+                }
+            }
+        }
+
+        for(auto & chrom : new_genome){
+            chrom.push_back('\n');
+            ofs.write(chrom.data(), long(chrom.size()));
+        }
+    }
+}
+
+void create_variants(std::vector<std::string>& genome, size_t g_len, float var_frac, long max_edit_len,
+                     size_t n_genomes, std::string& output_file){
+
+    long n_vars = ceil(float(g_len)*var_frac);
+
+    //event 0 = SNP
+    //event 1 = insertion
+    //event 2 = deletion
+    //event 3 = inversion
+    //event 4 = translocation
+    std::random_device dev;
+    std::mt19937 rng(dev());
+    std::discrete_distribution<int> distribution {94,3,2,1,0};
+    std::vector<std::string> new_genome = genome;
+
+    size_t events[5] = {0};
+    size_t sym_event[5] = {0};
+
+    std::vector<variant> genome_variants;
+    while (n_vars > 0) {
+
+        variant var;
+        var.type = distribution(rng);
+        events[var.type]++;
+
+        if (var.type == 0){//SNP
+            n_vars--;
+            var.chrom_1 = rand() % new_genome.size();
+            var.pos_1 = rand() % new_genome[var.chrom_1].size();
+
+            var.alt_allele = dna_symbols[rand() % 8];
+            while (var.alt_allele == new_genome[var.chrom_1][var.pos_1]) {
+                var.alt_allele = dna_symbols[rand() % 8];
+            }
+            sym_event[var.type]++;
+        } else {
+
+            var.chrom_1 = rand() % new_genome.size();
+            var.len = 1+rand() % long(max_edit_len);
+            assert(var.len <= max_edit_len);
+
+            var.pos_1 = rand() % (long(new_genome[var.chrom_1].size()) - var.len);
+            assert(var.pos_1 + var.len <= long(new_genome[var.chrom_1].size()));
+
+            if (var.type == 1) {//translocation
+                var.chrom_2 = rand() % new_genome.size();
+                var.pos_2 = rand() % (long(new_genome[var.chrom_2].size()) - var.len);
+
+                while(var.chrom_2 == var.chrom_1 && var.pos_1 == var.pos_2) {
+                    var.chrom_2 = rand() % new_genome.size();
+                    var.pos_2 = rand() % (long(new_genome[var.chrom_2].size()) - var.len);
+                }
+                assert(var.pos_2 + var.len <= long(new_genome[var.chrom_2].size()));
+
+                n_vars -= 2 * var.len;
+                sym_event[var.type]+=2*var.len;
+            } else if (var.type==2 || var.type == 3) {//inversion and deletion
+                n_vars -= var.len;
+                sym_event[var.type]+=var.len;
+            } else if (var.type == 4) {//insertion
+                var.alt_pat.resize(var.len);
+                for(long j = 0; j < var.len; j++) {//random string
+                    var.alt_pat[j] = dna_symbols[rand() % 8];
+                }
+                n_vars -= var.len;
+                sym_event[var.type]+=var.len;
+            } else {
+                std::cout << "Error" << std::endl;
+            }
+        }
+
+        double ref = rand() % 100;
+        double alt = 100-ref;
+        std::random_device dev_2;
+        std::mt19937 rng2(dev_2());
+        std::discrete_distribution<int> all_freq{ref, alt};
+        var.occ.resize(n_genomes);
+        for(size_t j=0;j<n_genomes;j++){
+            var.occ[j] = all_freq(rng2);
+        }
+        genome_variants.emplace_back(std::move(var));
+    }
+    std::cout <<"SNPs " << events[0] <<", translocation " << events[1] << ", inversions " << events[2] << ", deletions "
+              << events[3] << ", insertions " << events[4] << std::endl;
+
+    std::sort(genome_variants.begin(), genome_variants.end(), [](const variant& a, const variant& b){
+        if(a.type!=b.type){
+            return a.type<b.type;
+        }else{
+            if(a.chrom_1!=b.chrom_1){
+                return a.chrom_1<b.chrom_1;
+            }else{
+                return a.pos_1>b.pos_1;
+            }
+        }
+    });
+
+    /*for(size_t j=0;j<genome_variants.size();j++){
+        int counts =0;
+        for(size_t k=0;k<genome_variants[j].occ.size();k++){
+            counts+=genome_variants[j].occ[k];
+        }
+        std::cout<<genome_variants[j].type<<" : "<<genome_variants[j].chrom_1<<" "<<genome_variants[j].pos_1<<" -> "<<float(counts)/float(n_genomes)<<std::endl;
+    }*/
+    std::cout<<" Creating the genomes "<<std::endl;
+    apply_variants(genome, n_genomes, output_file, max_edit_len, genome_variants);
+    std::cout<<" Genomes stored in "<<output_file<<std::endl;
+}
+
+
+
+void insert_variants(std::vector<std::string>& genome, size_t g_len, float var_frac,
                      long max_edit_len, size_t n_genomes,
                      std::string& output_file){
 
-    char dna_symbols[8] = {'a', 'c', 'g', 't', 'A', 'C', 'T', 'G'};
     std::string buffer;
     buffer.resize(max_edit_len);
     std::ofstream ofs(output_file, std::ios::binary | std::ios::out);
@@ -128,7 +302,6 @@ void create_variants(std::vector<std::string>& genome, size_t g_len, float var_f
                     assert(pos_2 + ed_len <= long(new_genome[chrom_2].size()));
                     char *ptr1 = new_genome[chrom].data() + pos;
                     char *ptr2 = new_genome[chrom_2].data() + pos_2;
-
                     memcpy(buffer.data(), ptr1, ed_len);
                     memcpy(ptr1, ptr2, ed_len);
                     memcpy(ptr2, buffer.data(), ed_len);
