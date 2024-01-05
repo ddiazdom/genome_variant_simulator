@@ -4,6 +4,7 @@
 #include <cmath>
 #include <random>
 #include <fstream>
+#include <cassert>
 #include "kseq.h"
 #include "CLI11.hpp"
 
